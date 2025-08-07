@@ -62,21 +62,16 @@ jobs:
         echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}.img"
         echo "::endgroup::"
     
-    # 改进的磁盘空间检查 - 自动查找最大分区
-    - name: Check Disk Space
-      id: disk-check
+    # 改进的磁盘空间检查 - 自动查找最大分区并迁移工作区
+    - name: Check Disk Space and Setup Workspace
+      id: disk-setup
       run: |
         # 安装必要工具
         sudo apt update
-        sudo apt install -y util-linux jq
-        
-        # 获取所有分区信息并找到最大可用空间的分区
-        echo "::group::Disk Partition Information"
-        df -h
-        echo "::endgroup::"
+        sudo apt install -y util-linux
         
         # 获取所有挂载点的可用空间（以MB为单位）
-        PARTITION_INFO=$(df -B M --output=avail,target | tail -n +2)
+        PARTITION_INFO=$(df -B M --output=avail,pcent,target | tail -n +2)
         
         # 找到最大可用空间的分区
         MAX_SPACE=0
@@ -84,7 +79,7 @@ jobs:
         
         while read -r line; do
           SPACE=$(echo $line | awk '{print $1}' | tr -d 'M')
-          PARTITION=$(echo $line | awk '{print $2}')
+          PARTITION=$(echo $line | awk '{print $3}')
           
           # 跳过特殊文件系统和只读分区
           if [[ $PARTITION == /dev* ]] || [[ $PARTITION == /sys* ]] || [[ $PARTITION == /proc* ]] || 
@@ -118,12 +113,12 @@ jobs:
           if [[ $MAX_PARTITION == /home* ]]; then
             echo "清理Home分区..."
             # 保留最近2个工作区
-            if [ -d "/home/runner/actions-runner/_work" ]; then
-              cd /home/runner/actions-runner/_work
+            if [ -d "$MAX_PARTITION/runner/actions-runner/_work" ]; then
+              cd "$MAX_PARTITION/runner/actions-runner/_work"
               ls -t | tail -n +3 | xargs rm -rf
             fi
             # 清理旧日志
-            find /home/runner/actions-runner/cached/_diag -type f -mtime +7 -delete
+            find "$MAX_PARTITION/runner/actions-runner/cached/_diag" -type f -mtime +7 -delete || true
           else
             echo "清理系统分区..."
             sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d/* 
@@ -155,10 +150,20 @@ jobs:
           echo "✅ 磁盘空间充足: ${MAX_SPACE_GB}GB (>= ${MIN_SPACE}GB)"
         fi
         
+        # 在工作区创建前显示空间
+        echo "::group::Pre-Workspace Disk Usage on $MAX_PARTITION"
+        df -h $MAX_PARTITION
+        echo "::endgroup::"
+        
+        # 创建在最大分区上的工作区
+        WORKSPACE_PATH="$MAX_PARTITION/workspace"
+        mkdir -p "$WORKSPACE_PATH"
+        
         # 设置输出变量
         echo "max_partition=$MAX_PARTITION" >> $GITHUB_OUTPUT
         echo "free_space_gb=$MAX_SPACE_GB" >> $GITHUB_OUTPUT
         echo "min_required_gb=$MIN_SPACE" >> $GITHUB_OUTPUT
+        echo "workspace_path=$WORKSPACE_PATH" >> $GITHUB_OUTPUT
 
     # You might want to Checkout your repo first, but not mandatory
     - name: Check Out
@@ -205,19 +210,13 @@ jobs:
         sudo ln -sf ~/bin/repo /usr/bin/repo
         
         # 显示当前磁盘空间（重点显示最大分区）
-        echo "::group::Disk Space on ${{ steps.disk-check.outputs.max_partition }}"
-        df -h ${{ steps.disk-check.outputs.max_partition }}
+        echo "::group::Disk Space on ${{ steps.disk-setup.outputs.max_partition }}"
+        df -h ${{ steps.disk-setup.outputs.max_partition }}
         echo "::endgroup::"
     - name: Initialize repo
       run: |
-        # 在工作区创建前显示空间
-        echo "::group::Pre-Workspace Disk Usage"
-        df -h ${{ steps.disk-check.outputs.max_partition }}
-        echo "::endgroup::"
-        
-        mkdir workspace
-        cd workspace
-        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+        cd "${{ steps.disk-setup.outputs.workspace_path }}"
+        echo "workspace-folder=${{ steps.disk-setup.outputs.workspace_path }}" >> $GITHUB_OUTPUT
         git config --global user.name "Nico170420"
         git config --global user.email "b170420nc@gmail.com"
         repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
@@ -227,16 +226,16 @@ jobs:
       run: |
         # 显示同步前空间
         echo "::group::Disk Space Before Repo Sync"
-        df -h ${{ steps.disk-check.outputs.max_partition }}
+        df -h ${{ steps.disk-setup.outputs.max_partition }}
         echo "::endgroup::"
         
         repo sync -j$(nproc --all) --force-sync
         
         # 显示同步后空间
         echo "::group::Disk Space After Repo Sync"
-        df -h ${{ steps.disk-check.outputs.max_partition }}
+        df -h ${{ steps.disk-setup.outputs.max_partition }}
         echo "::endgroup::"
-      working-directory: workspace
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Clone device tree
       run: |
@@ -275,7 +274,7 @@ jobs:
       run: |
         # 显示构建前空间
         echo "::group::Disk Space Before Building"
-        df -h ${{ steps.disk-check.outputs.max_partition }}
+        df -h ${{ steps.disk-setup.outputs.max_partition }}
         echo "::endgroup::"
         
         source build/envsetup.sh
@@ -284,7 +283,7 @@ jobs:
         
         # 显示构建后空间
         echo "::group::Disk Space After Building"
-        df -h ${{ steps.disk-check.outputs.max_partition }}
+        df -h ${{ steps.disk-setup.outputs.max_partition }}
         du -sh out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*
         echo "::endgroup::"
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
@@ -293,9 +292,9 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: | 
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
+          ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img
+          ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+          ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         body: |
@@ -303,8 +302,8 @@ jobs:
           Device: ${{ github.event.inputs.DEVICE_NAME }}
           Target: ${{ github.event.inputs.BUILD_TARGET }}.img
           Disk Info: 
-            Partition: ${{ steps.disk-check.outputs.max_partition }}
-            Free Space: ${{ steps.disk-check.outputs.free_space_gb }}GB (before build)
-            Minimum Required: ${{ steps.disk-check.outputs.min_required_gb }}GB
+            Partition: ${{ steps.disk-setup.outputs.max_partition }}
+            Free Space: ${{ steps.disk-setup.outputs.free_space_gb }}GB (before build)
+            Minimum Required: ${{ steps.disk-setup.outputs.min_required_gb }}GB
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
