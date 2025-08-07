@@ -61,6 +61,45 @@ jobs:
         echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}"
         echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}.img"
         echo "::endgroup::"
+    
+    # 新增的磁盘空间检查步骤
+    - name: Check Disk Space
+      id: disk-check
+      run: |
+        # 获取磁盘使用信息
+        echo "::group::Disk Usage Before Cleanup"
+        df -h
+        echo "::endgroup::"
+        
+        # 检查可用空间（单位：GB）
+        FREE_SPACE_GB=$(df -BG --output=avail / | tail -1 | tr -d 'G ')
+        MIN_SPACE=25
+        
+        if [ "$FREE_SPACE_GB" -lt $MIN_SPACE ]; then
+          echo "⚠️ 警告：可用磁盘空间不足 (${FREE_SPACE_GB}GB < ${MIN_SPACE}GB)"
+          
+          # 清理缓存和旧文件
+          echo "::group::Cleaning Up Disk Space"
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d/* /usr/local/lib/android
+          sudo apt clean
+          sudo rm -rf /__t/* /__w/* /__e/*
+          docker system prune -af || true
+          echo "::endgroup::"
+          
+          # 重新检查空间
+          FREE_SPACE_GB=$(df -BG --output=avail / | tail -1 | tr -d 'G ')
+          if [ "$FREE_SPACE_GB" -lt $MIN_SPACE ]; then
+            echo "❌ 错误：清理后空间仍然不足 (${FREE_SPACE_GB}GB)"
+            exit 1
+          else
+            echo "✅ 清理成功，当前可用空间: ${FREE_SPACE_GB}GB"
+          fi
+        else
+          echo "✅ 磁盘空间充足: ${FREE_SPACE_GB}GB (>= ${MIN_SPACE}GB)"
+        fi
+        
+        # 设置后续步骤可用的输出值
+        echo "free_space_gb=$FREE_SPACE_GB" >> $GITHUB_OUTPUT
 
     # You might want to Checkout your repo first, but not mandatory
     - name: Check Out
@@ -81,6 +120,9 @@ jobs:
             xsltproc bc ccache lib32readline-dev lib32z1-dev liblz4-tool libncurses-dev libsdl1.2-dev \
             build-essential libgtk-3-dev libglu1-mesa-dev freeglut3-dev git libxml2 lzop pngcrush schedtool squashfs-tools \
             imagemagick libbz2-dev lzma ncftp qemu-user-static libstdc++-10-dev libncurses6 python3 tar
+        
+        # 安装磁盘监控工具
+        sudo apt install -yq ncdu
 
     - name: Install OpenJDK
       uses: actions/setup-java@v4
@@ -96,14 +138,18 @@ jobs:
       with:
           ssh-private-key: |
             ${{ secrets.SSH_PRIVATE_KEY }}
-
     - name: Install repo
       run: |
         mkdir ~/bin
         curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
         chmod a+x ~/bin/repo
         sudo ln -sf ~/bin/repo /usr/bin/repo
-
+        
+        # 显示当前磁盘空间
+        echo "::group::Disk Space Before Workspace Creation"
+        df -h
+        ncdu -x / --exclude /proc --exclude /sys --exclude /dev --exclude /mnt --exclude /media || true
+        echo "::endgroup::"
     - name: Initialize repo
       run: |
         mkdir workspace
@@ -116,7 +162,17 @@ jobs:
 
     - name: Repo Sync
       run: |
+        # 显示同步前空间
+        echo "::group::Disk Space Before Repo Sync"
+        df -h
+        echo "::endgroup::"
+        
         repo sync -j$(nproc --all) --force-sync
+        
+        # 显示同步后空间
+        echo "::group::Disk Space After Repo Sync"
+        df -h
+        echo "::endgroup::"
       working-directory: workspace
 
     - name: Clone device tree
@@ -154,9 +210,20 @@ jobs:
 
     - name: Building recovery
       run: |
+        # 显示构建前空间
+        echo "::group::Disk Space Before Building"
+        df -h
+        echo "::endgroup::"
+        
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+        
+        # 显示构建后空间
+        echo "::group::Disk Space After Building"
+        df -h
+        du -sh out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*
+        echo "::endgroup::"
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Upload to Release
@@ -172,5 +239,6 @@ jobs:
           Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
           Device: ${{ github.event.inputs.DEVICE_NAME }}
           Target: ${{ github.event.inputs.BUILD_TARGET }}.img
+          Free Space: ${{ steps.disk-check.outputs.free_space_gb }}GB (before build)
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
