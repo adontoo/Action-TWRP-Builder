@@ -62,24 +62,70 @@ jobs:
         echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}.img"
         echo "::endgroup::"
     
-    # 改进的磁盘空间检查 - 自动查找最大分区并迁移工作区
-    - name: Check Disk Space and Setup Workspace
-      id: disk-setup
+    # 改进的磁盘空间检查 - 同时监控根分区和最大分区
+    - name: Check Disk Space
+      id: disk-check
       run: |
         # 安装必要工具
         sudo apt update
-        sudo apt install -y util-linux
+        sudo apt install -y util-linux jq bc
         
-        # 获取所有挂载点的可用空间（以MB为单位）
-        PARTITION_INFO=$(df -B M --output=avail,pcent,target | tail -n +2)
+        # 获取所有分区信息
+        echo "::group::Disk Partition Information"
+        df -h
+        echo "::endgroup::"
         
-        # 找到最大可用空间的分区
+        # 1. 检查根分区空间
+        ROOT_SPACE_MB=$(df -B M --output=avail / | tail -1 | tr -d 'M ')
+        ROOT_SPACE_GB=$(echo "scale=1; $ROOT_SPACE_MB / 1024" | bc)
+        MIN_ROOT_SPACE=5
+        
+        echo "根分区可用空间: ${ROOT_SPACE_GB}GB (要求 >= ${MIN_ROOT_SPACE}GB)"
+        
+        if (( $(echo "$ROOT_SPACE_GB < $MIN_ROOT_SPACE" | bc -l) )); then
+          echo "⚠️ 警告：根分区空间不足，执行清理..."
+          echo "::group::Cleaning Root Partition (/)"
+          
+          # 清理Runner日志和缓存
+          if [ -d "/home/runner/actions-runner" ]; then
+            echo "清理Runner日志和缓存..."
+            find /home/runner/actions-runner/cached/_diag -type f -mtime +1 -delete
+            rm -rf /home/runner/actions-runner/_work/_temp
+          fi
+          
+          # 清理系统缓存
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d/* 
+          sudo apt clean
+          sudo rm -rf /__t/* /__w/* /__e/*
+          docker system prune -af || true
+          sudo rm -rf /tmp/*
+          sudo rm -rf /var/tmp/*
+          
+          echo "::endgroup::"
+          
+          # 重新检查根分区空间
+          ROOT_SPACE_MB=$(df -B M --output=avail / | tail -1 | tr -d 'M ')
+          ROOT_SPACE_GB=$(echo "scale=1; $ROOT_SPACE_MB / 1024" | bc)
+          
+          if (( $(echo "$ROOT_SPACE_GB < $MIN_ROOT_SPACE" | bc -l) )); then
+            echo "❌ 错误：根分区清理后空间仍然不足 (${ROOT_SPACE_GB}GB)"
+            exit 1
+          else
+            echo "✅ 根分区清理成功，当前可用空间: ${ROOT_SPACE_GB}GB"
+          fi
+        else
+          echo "✅ 根分区空间充足"
+        fi
+        
+        # 2. 查找最大可用空间的分区
+        PARTITION_INFO=$(df -B M --output=avail,target | tail -n +2)
+        
         MAX_SPACE=0
         MAX_PARTITION=""
         
         while read -r line; do
           SPACE=$(echo $line | awk '{print $1}' | tr -d 'M')
-          PARTITION=$(echo $line | awk '{print $3}')
+          PARTITION=$(echo $line | awk '{print $2}')
           
           # 跳过特殊文件系统和只读分区
           if [[ $PARTITION == /dev* ]] || [[ $PARTITION == /sys* ]] || [[ $PARTITION == /proc* ]] || 
@@ -95,7 +141,7 @@ jobs:
         done <<< "$PARTITION_INFO"
         
         # 转换为GB
-        MAX_SPACE_GB=$((MAX_SPACE / 1024))
+        MAX_SPACE_GB=$(echo "scale=1; $MAX_SPACE / 1024" | bc)
         
         echo "最大可用空间分区: $MAX_PARTITION"
         echo "可用空间: ${MAX_SPACE_GB}GB"
@@ -103,7 +149,7 @@ jobs:
         # 设置最小空间要求
         MIN_SPACE=25
         
-        if [ "$MAX_SPACE_GB" -lt "$MIN_SPACE" ]; then
+        if (( $(echo "$MAX_SPACE_GB < $MIN_SPACE" | bc -l) )); then
           echo "⚠️ 警告：最大分区空间不足 (${MAX_SPACE_GB}GB < ${MIN_SPACE}GB)"
           
           # 自动清理最大分区
@@ -113,57 +159,39 @@ jobs:
           if [[ $MAX_PARTITION == /home* ]]; then
             echo "清理Home分区..."
             # 保留最近2个工作区
-            if [ -d "$MAX_PARTITION/runner/actions-runner/_work" ]; then
-              cd "$MAX_PARTITION/runner/actions-runner/_work"
+            if [ -d "/home/runner/actions-runner/_work" ]; then
+              cd /home/runner/actions-runner/_work
               ls -t | tail -n +3 | xargs rm -rf
             fi
             # 清理旧日志
-            find "$MAX_PARTITION/runner/actions-runner/cached/_diag" -type f -mtime +7 -delete || true
+            find /home/runner/actions-runner/cached/_diag -type f -mtime +7 -delete
           else
-            echo "清理系统分区..."
-            sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d/* 
-            sudo apt clean
-            sudo rm -rf /__t/* /__w/* /__e/*
-            docker system prune -af || true
-          fi
-          
-          # 清理构建缓存
-          if [ -d "/tmp" ]; then
-            sudo rm -rf /tmp/*
-          fi
-          if [ -d "/var/tmp" ]; then
-            sudo rm -rf /var/tmp/*
+            echo "清理非Home分区（$MAX_PARTITION）..."
+            # 尝试清理该分区上的临时文件
+            sudo find $MAX_PARTITION -type f -name "*.tmp" -delete -o -name "*.temp" -delete
+            sudo find $MAX_PARTITION -type d -name "temp" -exec rm -rf {} + 2>/dev/null || true
           fi
           
           echo "::endgroup::"
           
           # 重新检查空间
-          MAX_SPACE_GB=$(($(df -B M --output=avail $MAX_PARTITION | tail -1 | tr -d 'M') / 1024))
+          MAX_SPACE_GB=$(echo "scale=1; $(df -B M --output=avail $MAX_PARTITION | tail -1 | tr -d 'M ') / 1024" | bc)
           
-          if [ "$MAX_SPACE_GB" -lt "$MIN_SPACE" ]; then
+          if (( $(echo "$MAX_SPACE_GB < $MIN_SPACE" | bc -l) )); then
             echo "❌ 错误：清理后空间仍然不足 (${MAX_SPACE_GB}GB)"
             exit 1
           else
             echo "✅ 清理成功，当前可用空间: ${MAX_SPACE_GB}GB"
           fi
         else
-          echo "✅ 磁盘空间充足: ${MAX_SPACE_GB}GB (>= ${MIN_SPACE}GB)"
+          echo "✅ 最大分区空间充足: ${MAX_SPACE_GB}GB (>= ${MIN_SPACE}GB)"
         fi
-        
-        # 在工作区创建前显示空间
-        echo "::group::Pre-Workspace Disk Usage on $MAX_PARTITION"
-        df -h $MAX_PARTITION
-        echo "::endgroup::"
-        
-        # 创建在最大分区上的工作区
-        WORKSPACE_PATH="$MAX_PARTITION/workspace"
-        mkdir -p "$WORKSPACE_PATH"
         
         # 设置输出变量
         echo "max_partition=$MAX_PARTITION" >> $GITHUB_OUTPUT
         echo "free_space_gb=$MAX_SPACE_GB" >> $GITHUB_OUTPUT
         echo "min_required_gb=$MIN_SPACE" >> $GITHUB_OUTPUT
-        echo "workspace_path=$WORKSPACE_PATH" >> $GITHUB_OUTPUT
+        echo "root_space_gb=$ROOT_SPACE_GB" >> $GITHUB_OUTPUT
 
     # You might want to Checkout your repo first, but not mandatory
     - name: Check Out
@@ -209,14 +237,23 @@ jobs:
         chmod a+x ~/bin/repo
         sudo ln -sf ~/bin/repo /usr/bin/repo
         
-        # 显示当前磁盘空间（重点显示最大分区）
-        echo "::group::Disk Space on ${{ steps.disk-setup.outputs.max_partition }}"
-        df -h ${{ steps.disk-setup.outputs.max_partition }}
+        # 显示当前磁盘空间（重点显示根分区和最大分区）
+        echo "::group::Disk Space Overview"
+        echo "根分区 (/): ${{ steps.disk-check.outputs.root_space_gb }}GB 可用"
+        echo "最大分区 (${{ steps.disk-check.outputs.max_partition }}): ${{ steps.disk-check.outputs.free_space_gb }}GB 可用"
+        df -h
         echo "::endgroup::"
     - name: Initialize repo
       run: |
-        cd "${{ steps.disk-setup.outputs.workspace_path }}"
-        echo "workspace-folder=${{ steps.disk-setup.outputs.workspace_path }}" >> $GITHUB_OUTPUT
+        # 在最大空间分区上创建工作区
+        WORKSPACE_PATH="${{ steps.disk-check.outputs.max_partition }}/workspace"
+        mkdir -p "$WORKSPACE_PATH"
+        cd "$WORKSPACE_PATH"
+        echo "workspace-folder=$WORKSPACE_PATH" >> $GITHUB_OUTPUT
+        
+        # 显示工作区位置
+        echo "工作区创建在: $WORKSPACE_PATH"
+        
         git config --global user.name "Nico170420"
         git config --global user.email "b170420nc@gmail.com"
         repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
@@ -226,14 +263,16 @@ jobs:
       run: |
         # 显示同步前空间
         echo "::group::Disk Space Before Repo Sync"
-        df -h ${{ steps.disk-setup.outputs.max_partition }}
+        echo "根分区 (/): $(df -h / | awk 'NR==2{print $4}') 可用"
+        echo "工作区分区 (${{ steps.disk-check.outputs.max_partition }}): $(df -h ${{ steps.disk-check.outputs.max_partition }} | awk 'NR==2{print $4}') 可用"
         echo "::endgroup::"
         
         repo sync -j$(nproc --all) --force-sync
         
         # 显示同步后空间
         echo "::group::Disk Space After Repo Sync"
-        df -h ${{ steps.disk-setup.outputs.max_partition }}
+        echo "根分区 (/): $(df -h / | awk 'NR==2{print $4}') 可用"
+        echo "工作区分区 (${{ steps.disk-check.outputs.max_partition }}): $(df -h ${{ steps.disk-check.outputs.max_partition }} | awk 'NR==2{print $4}') 可用"
         echo "::endgroup::"
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
@@ -274,7 +313,8 @@ jobs:
       run: |
         # 显示构建前空间
         echo "::group::Disk Space Before Building"
-        df -h ${{ steps.disk-setup.outputs.max_partition }}
+        echo "根分区 (/): $(df -h / | awk 'NR==2{print $4}') 可用"
+        echo "工作区分区 (${{ steps.disk-check.outputs.max_partition }}): $(df -h ${{ steps.disk-check.outputs.max_partition }} | awk 'NR==2{print $4}') 可用"
         echo "::endgroup::"
         
         source build/envsetup.sh
@@ -283,18 +323,26 @@ jobs:
         
         # 显示构建后空间
         echo "::group::Disk Space After Building"
-        df -h ${{ steps.disk-setup.outputs.max_partition }}
+        echo "根分区 (/): $(df -h / | awk 'NR==2{print $4}') 可用"
+        echo "工作区分区 (${{ steps.disk-check.outputs.max_partition }}): $(df -h ${{ steps.disk-check.outputs.max_partition }} | awk 'NR==2{print $4}') 可用"
         du -sh out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*
         echo "::endgroup::"
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Copy artifacts to workspace
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/release_artifacts
+        cp ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img $GITHUB_WORKSPACE/release_artifacts/
+        cp ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip $GITHUB_WORKSPACE/release_artifacts/ || true
+        cp ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img $GITHUB_WORKSPACE/release_artifacts/ || true
 
     - name: Upload to Release
       uses: softprops/action-gh-release@v2
       with:
         files: | 
-          ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img
-          ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-          ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
+          release_artifacts/${{ github.event.inputs.BUILD_TARGET }}.img
+          release_artifacts/*.zip
+          release_artifacts/*vendor*.img
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         body: |
@@ -302,8 +350,8 @@ jobs:
           Device: ${{ github.event.inputs.DEVICE_NAME }}
           Target: ${{ github.event.inputs.BUILD_TARGET }}.img
           Disk Info: 
-            Partition: ${{ steps.disk-setup.outputs.max_partition }}
-            Free Space: ${{ steps.disk-setup.outputs.free_space_gb }}GB (before build)
-            Minimum Required: ${{ steps.disk-setup.outputs.min_required_gb }}GB
+            Root Partition: ${{ steps.disk-check.outputs.root_space_gb }}GB free
+            Max Partition: ${{ steps.disk-check.outputs.max_partition }} (${{ steps.disk-check.outputs.free_space_gb }}GB free)
+            Minimum Required: ${{ steps.disk-check.outputs.min_required_gb }}GB
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
