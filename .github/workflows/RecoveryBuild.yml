@@ -186,6 +186,22 @@ jobs:
         else
           echo "✅ 最大分区空间充足: ${MAX_SPACE_GB}GB (>= ${MIN_SPACE}GB)"
         fi
+
+        # 清理Runner日志和缓存
+        if [ -d "/home/runner/actions-runner" ]; then
+          echo "清理Runner日志和缓存..."
+          find /home/runner/actions-runner/cached/_diag -type f -mtime +1 -delete
+          rm -rf /home/runner/actions-runner/_work/_temp
+        fi
+
+        echo "清理Home分区..."
+        # 保留最近2个工作区
+        if [ -d "/home/runner/actions-runner/_work" ]; then
+          cd /home/runner/actions-runner/_work
+          ls -t | tail -n +3 | xargs rm -rf
+        fi
+        # 清理旧日志
+        find /home/runner/actions-runner/cached/_diag -type f -mtime +7 -delete
         
         # 设置输出变量
         echo "max_partition=$MAX_PARTITION" >> $GITHUB_OUTPUT
